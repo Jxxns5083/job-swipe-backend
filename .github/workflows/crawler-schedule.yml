@@ -1,0 +1,17 @@
+name: Daily Job Crawler Trigger
+
+on:
+  schedule:
+    # 매일 한국 시간 새벽 3시 (UTC 18:00)에 자동 실행
+    - cron: '0 18 * * *'
+  workflow_dispatch: # 관리자가 수동으로 즉시 실행할 수 있는 버튼 활성화
+
+jobs:
+  trigger-crawler:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call Backend API to Trigger Crawler
+        run: |
+          curl -X POST "https://job-swipe-backend-16cp.onrender.com/api/v1/admin/trigger-crawl" \
+          -H "accept: application/json" \
+          -d ""
