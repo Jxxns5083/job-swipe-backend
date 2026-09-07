@@ -1,18 +1,26 @@
 import os
 import json
+import asyncio
+import httpx
+from bs4 import BeautifulSoup
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from supabase import create_client, Client
 from openai import OpenAI
 
-# FastAPI 앱 초기화
-app = FastAPI(title="Job Swipe App AI Onboarding API", version="1.0.0")
+# 1. 서버 및 클라이언트 초기화
+app = FastAPI(title="Job Swipe App API", version="2.0.0")
 
-# -------------------------------------------------------------
-# 1. 환경 변수 및 클라이언트 설정
-# (Render 배포 시 환경변수 창에서 입력한 키 값이 자동으로 연결됩니다)
-# -------------------------------------------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -20,116 +28,102 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 ai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# -------------------------------------------------------------
-# 2. 요청/응답 데이터 모델 정의
-# -------------------------------------------------------------
-class ChatMessage(BaseModel):
-    role: str  # 'user' 또는 'assistant'
-    content: str
-
-class OnboardingExtractRequest(BaseModel):
-    dialogue_history: List[ChatMessage]
-
-class ParsedProfile(BaseModel):
-    primary_role: str = Field(description="정제된 표준 직무명 (예: HR, 물류/SCM, 기획 등)")
-    years_of_experience: int = Field(description="총 경력 연차 (숫자만 추출, 신입은 0)")
-    min_salary: int = Field(description="희망 최소 연봉 (단위: 만 원, 미언급 시 0)")
-    preferred_locations: List[str] = Field(description="희망 근무 지역 목록 (시/구 단위)")
-    core_competencies: List[str] = Field(description="보유 핵심 역량 및 스킬 키워드 3~5개")
-    summary_raw: str = Field(description="구직자의 전체 프로필을 1줄로 요약한 문장")
-
 class SwipeActionRequest(BaseModel):
     user_id: str
     job_id: str
-    action: str  # 'PASS' 또는 'APPLY'
+    action: str
 
-# -------------------------------------------------------------
-# 3. API 엔드포인트
-# -------------------------------------------------------------
-
-@app.get("/")
-def health_check():
-    return {"status": "healthy", "service": "Job Swipe Matching Backend"}
-
-@app.post("/api/v1/onboarding/parse-and-save")
-async def parse_and_save_profile(payload: OnboardingExtractRequest):
-    """
-    온보딩 대화 기록을 AI가 분석하여 정형 데이터로 변환 후 Supabase DB에 저장
-    """
-    try:
-        dialogue_text = "\n".join([f"{msg.role}: {msg.content}" for msg in payload.dialogue_history])
-
-        system_prompt = (
-            "당신은 채용 플랫폼의 전문 커리어 어드바이저입니다. "
-            "구직자와의 온보딩 대화 기록을 분석하여 정확한 스펙을 JSON 포맷으로 추출하세요. "
-            "연봉은 '만 원' 단위의 숫자여야 하며, 명시되지 않은 경우 0으로 표기합니다. "
-            "경력 연차는 명시된 숫자를 기준으로 정수값으로 반환하세요."
-        )
-
-        response = ai_client.beta.chat.completions.parse(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"다음 대화에서 프로필 데이터를 추출해줘:\n\n{dialogue_text}"}
-            ],
-            response_format=ParsedProfile
-        )
-
-        extracted: ParsedProfile = response.choices[0].message.parsed
-
-        db_data = {
-            "primary_role": extracted.primary_role,
-            "years_of_experience": extracted.years_of_experience,
-            "min_salary": extracted.min_salary,
-            "preferred_locations": extracted.preferred_locations,
-            "core_competencies": extracted.core_competencies,
-            "summary_raw": extracted.summary_raw
-        }
-
-        db_response = supabase.table("profiles").insert(db_data).execute()
-
-        if not db_response.data:
-            raise HTTPException(status_code=500, detail="데이터베이스 저장 실패")
-
-        saved_profile = db_response.data[0]
-        return {
-            "success": True,
-            "profile_id": saved_profile["id"],
-            "profile": db_data
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
+# 2. 기본 API (피드 조회, 스와이프 로깅)
 @app.get("/api/v1/jobs/feed")
-async def get_job_feed(user_id: Optional[str] = None):
-    """
-    카드 스와이프 화면용 공고 20건 반환
-    """
+async def get_job_feed():
     try:
-        query = supabase.table("jobs").select("*").eq("is_active", True).limit(20)
+        query = supabase.table("jobs").select("*").order("created_at", desc=True).limit(20)
         result = query.execute()
         return {"jobs": result.data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/api/v1/jobs/swipe")
 async def record_swipe(payload: SwipeActionRequest):
-    """
-    왼쪽(PASS) 또는 오른쪽(APPLY) 스와이프 액션 DB 기록
-    """
-    if payload.action not in ["PASS", "APPLY"]:
-        raise HTTPException(status_code=400, detail="action은 'PASS' 또는 'APPLY'여야 합니다.")
-
     try:
-        swipe_data = {
-            "user_id": payload.user_id,
-            "job_id": payload.job_id,
-            "action": payload.action
-        }
-        res = supabase.table("swipes").upsert(swipe_data).execute()
-        return {"success": True, "data": res.data}
+        swipe_data = {"user_id": payload.user_id, "job_id": payload.job_id, "action": payload.action}
+        supabase.table("swipes").upsert(swipe_data).execute()
+        return {"success": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# 3. 자동 크롤링 & AI 파싱 파이프라인
+async def run_crawler_pipeline():
+    # 타겟 공고 원문 (실제 상용화 시 BeautifulSoup을 이용해 URL에서 동적으로 긁어옵니다)
+    target_urls = ["https://example.com/careers/job-1234"]
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for url in target_urls:
+            try:
+                # 테스트용 모의 원문 데이터
+                raw_text = """
+                [채용 공고] 데이터 엔지니어 (Data Engineer) 대규모 채용
+                담당 업무: 전사 데이터 파이프라인 구축, DW 설계 및 운영, Airflow 기반 배치 작업.
+                자격 요건: Python, SQL 능숙자. 관련 경력 3년 이상 7년 이하.
+                우대 사항: 대용량 트래픽 처리 경험, 클라우드(AWS/GCP) 환경 경험.
+                근무지: 서울 판교. 연봉: 6,000만원 ~ 8,000만원.
+                복리후생: 매월 체력단련비 지급, 유연근무제.
+                """
+
+                prompt = f"""
+                채용 공고 원문을 분석하여 JSON 형태로 변환하세요.
+                원문: {raw_text}
+                반환 필수 필드 (JSON):
+                - company_name: 기업명
+                - position_title: 직무 제목
+                - experience_min: 최소 요구 경력 (숫자만, 신입은 0)
+                - experience_max: 최대 요구 경력 (숫자만)
+                - location_short: 근무지 짧은 요약
+                - salary_min: 최소 연봉 (단위: 만원)
+                - salary_max: 최대 연봉 (단위: 만원)
+                - summary_points: 매력 포인트 3가지 (각 1줄, 배열 형태)
+                - details_tasks: 주요 업무 요약
+                - details_reqs: 자격 요건 요약
+                - details_perks: 혜택 및 복지 요약
+                """
+
+                res = ai_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": "Return only valid JSON."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    response_format={"type": "json_object"}
+                )
+
+                parsed_data = json.loads(res.choices[0].message.content)
+
+                db_payload = {
+                    "company_name": parsed_data.get("company_name", "미상"),
+                    "position_title": parsed_data.get("position_title", "직무 미상"),
+                    "experience_min": parsed_data.get("experience_min", 0),
+                    "experience_max": parsed_data.get("experience_max", 99),
+                    "location_short": parsed_data.get("location_short", "위치 미상"),
+                    "salary_min": parsed_data.get("salary_min", 0),
+                    "salary_max": parsed_data.get("salary_max", 0),
+                    "summary_points": parsed_data.get("summary_points", []),
+                    "detail_content": {
+                        "tasks": parsed_data.get("details_tasks", ""),
+                        "reqs": parsed_data.get("details_reqs", ""),
+                        "perks": parsed_data.get("details_perks", "")
+                    },
+                    "apply_url": url,
+                    "is_active": True
+                }
+
+                supabase.table("jobs").insert(db_payload).execute()
+                await asyncio.sleep(2)
+
+            except Exception as e:
+                print(f"Error crawling {url}: {e}")
+                continue
+
+@app.post("/api/v1/admin/trigger-crawl")
+async def trigger_crawling(background_tasks: BackgroundTasks):
+    background_tasks.add_task(run_crawler_pipeline)
+    return {"message": "크롤링 파이프라인이 실행되었습니다."}
